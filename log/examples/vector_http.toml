@@ -1,0 +1,16 @@
+[sources.my_source_http_server]
+type = "http_server"
+address = "0.0.0.0:3003"
+encoding = "json"
+host_key = "hostname"
+method = "POST"
+path = "/log"
+path_key = "path"
+response_code = 200
+# strict_path = true
+
+[sinks.my_sink_console]
+type = "console"
+inputs = ["my_source_http_server"]
+target = "stdout"
+encoding.codec = "json"

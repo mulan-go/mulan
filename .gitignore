@@ -1,0 +1,33 @@
+# Operating systems
+.DS_Store
+._*
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Logs, tests, and coverage
+*.log
+*.out
+*.test
+coverage/
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+.next/
+.nuxt/
+.svelte-kit/
+*.tsbuildinfo
+
+# Temporary directories
+.cache/
+tmp/

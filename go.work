@@ -1,0 +1,23 @@
+go 1.26.5
+
+use (
+	./app
+	./auth
+	./captcha
+	./dbx
+	./heartbeat
+	./log
+	./passwd
+	./rdb
+	./req
+	./rsp
+	./vault
+	./web
+)
+
+replace (
+	github.com/mulan-go/mulan/app v0.5.2 => ./app
+	github.com/mulan-go/mulan/rdb v0.1.1 => ./rdb
+	github.com/mulan-go/mulan/req v0.1.1 => ./req
+	github.com/mulan-go/mulan/rsp v0.1.1 => ./rsp
+)
