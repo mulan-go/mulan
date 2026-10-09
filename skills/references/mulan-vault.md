@@ -117,7 +117,7 @@ var (
 ```
 
 - 空 Secret 名称会返回参数错误
-- KV 返回空 Secret 时包装 `ErrSecretNotFound`
+- KV Secret 不存在、已删除或已销毁时包装 `ErrSecretNotFound`；合法的空 Data map 可以正常读取
 - nil 或未初始化客户端返回 `ErrNotInitClient`
 
 ## 长连接令牌续期
@@ -131,7 +131,7 @@ if err := v.Login(ctx); err != nil {
 v.KeepAlive(ctx)
 ```
 
-后台任务每 12 小时尝试续期 24 小时；续期失败时重新执行 AppRole 登录，`ctx` 取消后退出。
+后台任务在 Token 剩余 TTL 的一半处尝试续期，请求增量为 24 小时，但后续调度以 Vault 实际返回的 TTL 为准。不可续期或已过期的 Token 会重新执行 AppRole 登录；续期失败时也会重新登录，登录失败后每 5 秒重试。TTL 为 0 的 Token 不会过期，无需续期。`ctx` 取消后停止等待并取消正在进行的请求。
 
 ## 配置优先级与安全约束
 

@@ -18,7 +18,11 @@ import (
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
-	return f(r)
+	response, err := f(r)
+	if response != nil && response.Request == nil {
+		response.Request = r
+	}
+	return response, err
 }
 
 func newTestVault(t *testing.T, mount string, transport roundTripFunc) *Vault {
@@ -66,6 +70,47 @@ func TestInjectContextUsesConfiguredMount(t *testing.T) {
 	}
 	if got := viper.GetString("region"); got != "cn-east-1" {
 		t.Fatalf("injected region = %q, want cn-east-1", got)
+	}
+}
+
+func TestUnavailableSecret(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "missing", body: `{}`},
+		{name: "deleted", body: `{"data":{"data":null,"metadata":{"version":2,"deletion_time":"2026-10-08T00:00:00Z","destroyed":false}}}`},
+		{name: "destroyed", body: `{"data":{"data":null,"metadata":{"version":2,"deletion_time":"","destroyed":true}}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newTestVault(t, defaultMount, func(*http.Request) (*http.Response, error) {
+				return jsonResponse(http.StatusNotFound, tt.body), nil
+			})
+			data, err := v.GetSecret(context.Background(), "service")
+			if data != nil || !errors.Is(err, ErrSecretNotFound) {
+				t.Errorf("GetSecret() = (%v, %v), want (nil, ErrSecretNotFound)", data, err)
+			}
+			viper.Reset()
+			t.Cleanup(viper.Reset)
+			viper.Set("region", "previous-region")
+			if err := v.InjectContext(context.Background(), "service"); !errors.Is(err, ErrSecretNotFound) {
+				t.Errorf("InjectContext() error = %v, want ErrSecretNotFound", err)
+			}
+			if got := viper.GetString("region"); got != "previous-region" {
+				t.Errorf("region = %q, want previous-region", got)
+			}
+		})
+	}
+}
+
+func TestGetSecretAcceptsEmptyData(t *testing.T) {
+	v := newTestVault(t, defaultMount, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"data":{"data":{},"metadata":{}}}`), nil
+	})
+	data, err := v.GetSecret(context.Background(), "service")
+	if err != nil || data == nil || len(data) != 0 {
+		t.Fatalf("GetSecret() = (%v, %v), want non-nil empty map and nil error", data, err)
 	}
 }
 

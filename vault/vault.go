@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	tokenRenewInterval  = 12 * time.Hour
-	tokenRenewIncrement = 24 * time.Hour
+	tokenRenewIncrement     = 24 * time.Hour
+	tokenLoginRetryInterval = 5 * time.Second
 )
 
 var (
@@ -34,6 +34,16 @@ type Vault struct {
 	secretID *approle.SecretID
 	mount    string
 	client   *vault.Client
+
+	// Serialize token updates so the client token and its lease stay consistent.
+	tokenMu sync.Mutex
+	lease   *tokenLease
+}
+
+type tokenLease struct {
+	expiresAt time.Time
+	renewable bool
+	changed   chan struct{}
 }
 
 func Init() (*Vault, error) {
@@ -66,13 +76,6 @@ func NewVault(cfg *Config) (*Vault, error) {
 	return v, nil
 }
 
-func (v *Vault) Client() (*vault.Client, error) {
-	if v == nil || v.client == nil {
-		return nil, ErrNotInitClient
-	}
-	return v.client, nil
-}
-
 func (v *Vault) Inject(name string) {
 	ctx := context.Background()
 	if err := v.Login(ctx); err != nil {
@@ -88,27 +91,36 @@ func (v *Vault) Inject(name string) {
 	}
 }
 
+func (v *Vault) GetSecret(
+	ctx context.Context,
+	name string,
+) (map[string]any, error) {
+	client, err := v.Client()
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("read vault config: secret name is required")
+	}
+	secret, err := client.KVv2(v.mount).Get(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("read vault config %q: %w", name, err)
+	}
+	if secret == nil || secret.Data == nil {
+		return nil, fmt.Errorf("%w: %q", ErrSecretNotFound, name)
+	}
+	return secret.Data, nil
+}
+
 func (v *Vault) InjectContext(
 	ctx context.Context,
 	name string,
 ) error {
-	client, err := v.Client()
+	data, err := v.GetSecret(ctx, name)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(name) == "" {
-		return fmt.Errorf("read vault config: secret name is required")
-	}
-
-	secret, err := client.KVv2(v.mount).Get(ctx, name)
-	if err != nil {
-		return fmt.Errorf("read vault config %q: %w", name, err)
-	}
-	if secret == nil {
-		return fmt.Errorf("%w: %q", ErrSecretNotFound, name)
-	}
-
-	for key, value := range secret.Data {
+	for key, value := range data {
 		viper.Set(key, value)
 	}
 	return nil
@@ -124,6 +136,9 @@ func (v *Vault) Login(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create AppRole auth: %w", err)
 	}
+	v.tokenMu.Lock()
+	defer v.tokenMu.Unlock()
+	startedAt := time.Now()
 	authInfo, err := client.Auth().Login(ctx, auth)
 	if err != nil {
 		return fmt.Errorf("AppRole login: %w", err)
@@ -136,10 +151,11 @@ func (v *Vault) Login(ctx context.Context) error {
 		return errors.New("AppRole login returned an empty token")
 	}
 	client.SetToken(token)
+	v.recordTokenLease(authInfo.Auth, startedAt)
 	return nil
 }
 
-// KeepAlive 启动后台 goroutine 定期续期 Token，续期失败时自动 re-login。
+// KeepAlive 启动后台 goroutine 按实际 TTL 提前续期 Token，不可续期或续期失败时重新登录。
 // 适用于需要长期保持 Vault 会话的服务（如 cicd）；一次性登录取配置的服务无需调用。
 func (v *Vault) KeepAlive(ctx context.Context) {
 	if _, err := v.Client(); err != nil {
@@ -158,26 +174,103 @@ func (v *Vault) reLogin(ctx context.Context) error {
 }
 
 func (v *Vault) keepTokenAlive(ctx context.Context) {
-	ticker := time.NewTicker(tokenRenewInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_, err := v.client.Auth().Token().RenewSelfWithContext(ctx, int(tokenRenewIncrement/time.Second))
-			if err == nil {
+	for ctx.Err() == nil {
+		v.tokenMu.Lock()
+		lease := v.lease
+		v.tokenMu.Unlock()
+		if lease != nil {
+			// A zero TTL denotes a token that does not expire. Keep watching
+			// for Login replacing it with a token that needs renewal.
+			var timer *time.Timer
+			var renewalDue <-chan time.Time
+			if !lease.expiresAt.IsZero() {
+				timer = time.NewTimer(max(time.Until(lease.expiresAt)/2, 0))
+				renewalDue = timer.C
+			}
+			select {
+			case <-ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case <-lease.changed:
+				if timer != nil {
+					timer.Stop()
+				}
 				continue
+			case <-renewalDue:
+				timer.Stop()
 			}
 			if ctx.Err() != nil {
 				return
 			}
-			zap.L().Warn("vault token renew failed, attempting re-login", zap.Error(err))
-			if reErr := v.reLogin(ctx); reErr != nil {
-				zap.L().Warn("vault re-login failed", zap.Error(reErr))
+			if lease.renewable && time.Now().Before(lease.expiresAt) {
+				if err := v.renewToken(ctx, lease); err == nil {
+					continue
+				} else if ctx.Err() != nil {
+					return
+				} else {
+					zap.L().Warn("vault token renew failed, attempting re-login", zap.Error(err))
+				}
 			}
 		}
+		for ctx.Err() == nil {
+			if err := v.reLogin(ctx); err == nil {
+				break
+			} else if ctx.Err() != nil {
+				return
+			} else {
+				zap.L().Warn("vault re-login failed", zap.Error(err))
+			}
+			if !waitForToken(ctx, tokenLoginRetryInterval) {
+				return
+			}
+		}
+	}
+}
+
+func (v *Vault) renewToken(ctx context.Context, lease *tokenLease) error {
+	v.tokenMu.Lock()
+	defer v.tokenMu.Unlock()
+	if v.lease != lease {
+		return nil
+	}
+	startedAt := time.Now()
+	secret, err := v.client.Auth().Token().RenewSelfWithContext(ctx, int(tokenRenewIncrement/time.Second))
+	if err != nil {
+		return err
+	}
+	if secret == nil || secret.Auth == nil {
+		return errors.New("vault token renewal returned no auth data")
+	}
+	v.recordTokenLease(secret.Auth, startedAt)
+	return nil
+}
+
+// recordTokenLease must be called with tokenMu held. Use the request start time
+// to avoid overestimating the remaining TTL when the response is delayed.
+func (v *Vault) recordTokenLease(auth *vault.SecretAuth, startedAt time.Time) {
+	lease := &tokenLease{
+		renewable: auth.Renewable,
+		changed:   make(chan struct{}),
+	}
+	if auth.LeaseDuration > 0 {
+		lease.expiresAt = startedAt.Add(time.Duration(auth.LeaseDuration) * time.Second)
+	}
+	if v.lease != nil {
+		close(v.lease.changed)
+	}
+	v.lease = lease
+}
+
+func waitForToken(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
 	}
 }
 
@@ -218,4 +311,13 @@ func Inject(name string, configs ...*Config) {
 		return
 	}
 	v.Inject(name)
+}
+
+func (v *Vault) Mount() string { return v.mount }
+
+func (v *Vault) Client() (*vault.Client, error) {
+	if v == nil || v.client == nil {
+		return nil, ErrNotInitClient
+	}
+	return v.client, nil
 }
