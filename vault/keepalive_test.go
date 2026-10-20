@@ -133,6 +133,68 @@ func TestKeepAliveTracksLoginDuringRetry(t *testing.T) {
 	}
 }
 
+func TestKeepAliveTracksFirstLoginDuringRetry(t *testing.T) {
+	for _, ttl := range []int{0, 2} {
+		t.Run(fmt.Sprint(ttl), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var logins, renewals int
+				var expiresAt time.Time
+				v := newTestVault(t, defaultMount, func(r *http.Request) (*http.Response, error) {
+					switch r.URL.Path {
+					case "/v1/auth/approle/login":
+						logins++
+						if logins != 2 {
+							return jsonResponse(http.StatusForbidden, `{"errors":["login unavailable"]}`), nil
+						}
+						expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
+						return jsonResponse(http.StatusOK, fmt.Sprintf(`{"auth":{"client_token":"token","lease_duration":%d,"renewable":true}}`, ttl)), nil
+					case "/v1/auth/token/renew-self":
+						renewals++
+						if !time.Now().Before(expiresAt) {
+							t.Error("first token expired before renewal")
+						}
+						if got := r.Header.Get("X-Vault-Token"); got != "token" {
+							t.Errorf("renewal token = %q, want token", got)
+						}
+						expiresAt = time.Now().Add(time.Hour)
+						return jsonResponse(http.StatusOK, `{"auth":{"client_token":"token","lease_duration":3600,"renewable":true}}`), nil
+					default:
+						t.Errorf("unexpected request path %q", r.URL.Path)
+						return jsonResponse(http.StatusNotFound, `{}`), nil
+					}
+				})
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					v.keepTokenAlive(ctx)
+				}()
+				synctest.Wait()
+				if logins != 1 {
+					t.Fatalf("logins = %d, want one failed initial login", logins)
+				}
+				time.Sleep(time.Second)
+				if err := v.Login(ctx); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				time.Sleep(6 * time.Second)
+				synctest.Wait()
+				cancel()
+				<-done
+				wantRenewals := 0
+				if ttl > 0 {
+					wantRenewals = 1
+				}
+				if logins != 2 || renewals != wantRenewals {
+					t.Errorf("logins = %d, renewals = %d, want two logins and %d renewals", logins, renewals, wantRenewals)
+				}
+			})
+		})
+	}
+}
+
 func TestTokenOperationsCancelWhileLoginIsBlocked(t *testing.T) {
 	operations := []struct {
 		name string
