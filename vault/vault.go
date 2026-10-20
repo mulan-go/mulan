@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	tokenRenewIncrement     = 24 * time.Hour
-	tokenLoginRetryInterval = 5 * time.Second
+	tokenRenewIncrement = 24 * time.Hour
+	tokenRetryInterval  = 5 * time.Second
 )
 
 var (
@@ -35,9 +35,9 @@ type Vault struct {
 	mount    string
 	client   *vault.Client
 
-	// Serialize token updates so the client token and its lease stay consistent.
-	tokenMu sync.Mutex
-	lease   *tokenLease
+	// Serialize token updates while allowing waiting callers to cancel.
+	tokenLock chan struct{}
+	lease     *tokenLease
 }
 
 type tokenLease struct {
@@ -67,10 +67,11 @@ func NewVault(cfg *Config) (*Vault, error) {
 	}
 
 	v := &Vault{
-		roleID:   cfg.RoleID,
-		secretID: &approle.SecretID{FromString: cfg.SecretID},
-		mount:    cfg.mount(),
-		client:   client,
+		roleID:    cfg.RoleID,
+		secretID:  &approle.SecretID{FromString: cfg.SecretID},
+		mount:     cfg.mount(),
+		client:    client,
+		tokenLock: make(chan struct{}, 1),
 	}
 	setDefault(v)
 	return v, nil
@@ -136,8 +137,10 @@ func (v *Vault) Login(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create AppRole auth: %w", err)
 	}
-	v.tokenMu.Lock()
-	defer v.tokenMu.Unlock()
+	if err := v.lockToken(ctx); err != nil {
+		return err
+	}
+	defer v.unlockToken()
 	startedAt := time.Now()
 	authInfo, err := client.Auth().Login(ctx, auth)
 	if err != nil {
@@ -174,26 +177,45 @@ func (v *Vault) reLogin(ctx context.Context) error {
 }
 
 func (v *Vault) keepTokenAlive(ctx context.Context) {
+	var retry bool
+	var failedLease *tokenLease
 	for ctx.Err() == nil {
-		v.tokenMu.Lock()
+		if err := v.lockToken(ctx); err != nil {
+			return
+		}
 		lease := v.lease
-		v.tokenMu.Unlock()
+		v.unlockToken()
+
+		var timer *time.Timer
+		var renewalDue <-chan time.Time
+		var changed <-chan struct{}
 		if lease != nil {
-			// A zero TTL denotes a token that does not expire. Keep watching
-			// for Login replacing it with a token that needs renewal.
-			var timer *time.Timer
-			var renewalDue <-chan time.Time
-			if !lease.expiresAt.IsZero() {
-				timer = time.NewTimer(max(time.Until(lease.expiresAt)/2, 0))
-				renewalDue = timer.C
+			changed = lease.changed
+		}
+		if retry && lease == failedLease {
+			delay := tokenRetryInterval
+			if lease != nil && lease.renewable {
+				if remaining := time.Until(lease.expiresAt); remaining > 0 {
+					delay = min(delay, max(remaining/2, time.Nanosecond))
+				}
 			}
+			timer = time.NewTimer(delay)
+		} else if lease != nil && !lease.expiresAt.IsZero() {
+			timer = time.NewTimer(max(time.Until(lease.expiresAt)/2, 0))
+		}
+		if timer != nil {
+			renewalDue = timer.C
+		}
+		// Non-expiring tokens only wait for cancellation or a replacement lease.
+		// Without a lease, log in immediately unless a previous attempt failed.
+		if lease != nil || timer != nil {
 			select {
 			case <-ctx.Done():
 				if timer != nil {
 					timer.Stop()
 				}
 				return
-			case <-lease.changed:
+			case <-changed:
 				if timer != nil {
 					timer.Stop()
 				}
@@ -201,37 +223,38 @@ func (v *Vault) keepTokenAlive(ctx context.Context) {
 			case <-renewalDue:
 				timer.Stop()
 			}
-			if ctx.Err() != nil {
-				return
-			}
-			if lease.renewable && time.Now().Before(lease.expiresAt) {
-				if err := v.renewToken(ctx, lease); err == nil {
-					continue
-				} else if ctx.Err() != nil {
-					return
-				} else {
-					zap.L().Warn("vault token renew failed, attempting re-login", zap.Error(err))
-				}
-			}
 		}
-		for ctx.Err() == nil {
-			if err := v.reLogin(ctx); err == nil {
-				break
+		if ctx.Err() != nil {
+			return
+		}
+		if lease != nil && lease.renewable && time.Now().Before(lease.expiresAt) {
+			if err := v.renewToken(ctx, lease); err == nil {
+				retry = false
+				continue
 			} else if ctx.Err() != nil {
 				return
 			} else {
-				zap.L().Warn("vault re-login failed", zap.Error(err))
-			}
-			if !waitForToken(ctx, tokenLoginRetryInterval) {
-				return
+				zap.L().Warn("vault token renew failed, attempting re-login", zap.Error(err))
 			}
 		}
+		if err := v.reLogin(ctx); err == nil {
+			retry = false
+			continue
+		} else if ctx.Err() != nil {
+			return
+		} else {
+			zap.L().Warn("vault re-login failed", zap.Error(err))
+		}
+		retry = true
+		failedLease = lease
 	}
 }
 
 func (v *Vault) renewToken(ctx context.Context, lease *tokenLease) error {
-	v.tokenMu.Lock()
-	defer v.tokenMu.Unlock()
+	if err := v.lockToken(ctx); err != nil {
+		return err
+	}
+	defer v.unlockToken()
 	if v.lease != lease {
 		return nil
 	}
@@ -247,7 +270,7 @@ func (v *Vault) renewToken(ctx context.Context, lease *tokenLease) error {
 	return nil
 }
 
-// recordTokenLease must be called with tokenMu held. Use the request start time
+// recordTokenLease must be called with tokenLock held. Use the request start time
 // to avoid overestimating the remaining TTL when the response is delayed.
 func (v *Vault) recordTokenLease(auth *vault.SecretAuth, startedAt time.Time) {
 	lease := &tokenLease{
@@ -263,15 +286,25 @@ func (v *Vault) recordTokenLease(auth *vault.SecretAuth, startedAt time.Time) {
 	v.lease = lease
 }
 
-func waitForToken(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
+func (v *Vault) lockToken(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	select {
 	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return ctx.Err() == nil
+		return ctx.Err()
+	case v.tokenLock <- struct{}{}:
+		// Both cases can be ready when cancellation races with acquisition.
+		if err := ctx.Err(); err != nil {
+			v.unlockToken()
+			return err
+		}
+		return nil
 	}
+}
+
+func (v *Vault) unlockToken() {
+	<-v.tokenLock
 }
 
 func setDefault(v *Vault) {
