@@ -38,12 +38,13 @@ type Vault struct {
 	// Serialize token updates while allowing waiting callers to cancel.
 	tokenLock chan struct{}
 	lease     *tokenLease
+	// Notify waiters even when Login installs the first lease.
+	leaseChanged chan struct{}
 }
 
 type tokenLease struct {
 	expiresAt time.Time
 	renewable bool
-	changed   chan struct{}
 }
 
 func Init() (*Vault, error) {
@@ -67,11 +68,12 @@ func NewVault(cfg *Config) (*Vault, error) {
 	}
 
 	v := &Vault{
-		roleID:    cfg.RoleID,
-		secretID:  &approle.SecretID{FromString: cfg.SecretID},
-		mount:     cfg.mount(),
-		client:    client,
-		tokenLock: make(chan struct{}, 1),
+		roleID:       cfg.RoleID,
+		secretID:     &approle.SecretID{FromString: cfg.SecretID},
+		mount:        cfg.mount(),
+		client:       client,
+		tokenLock:    make(chan struct{}, 1),
+		leaseChanged: make(chan struct{}),
 	}
 	setDefault(v)
 	return v, nil
@@ -184,14 +186,11 @@ func (v *Vault) keepTokenAlive(ctx context.Context) {
 			return
 		}
 		lease := v.lease
+		changed := v.leaseChanged
 		v.unlockToken()
 
 		var timer *time.Timer
 		var renewalDue <-chan time.Time
-		var changed <-chan struct{}
-		if lease != nil {
-			changed = lease.changed
-		}
 		if retry && lease == failedLease {
 			delay := tokenRetryInterval
 			if lease != nil && lease.renewable {
@@ -275,15 +274,13 @@ func (v *Vault) renewToken(ctx context.Context, lease *tokenLease) error {
 func (v *Vault) recordTokenLease(auth *vault.SecretAuth, startedAt time.Time) {
 	lease := &tokenLease{
 		renewable: auth.Renewable,
-		changed:   make(chan struct{}),
 	}
 	if auth.LeaseDuration > 0 {
 		lease.expiresAt = startedAt.Add(time.Duration(auth.LeaseDuration) * time.Second)
 	}
-	if v.lease != nil {
-		close(v.lease.changed)
-	}
 	v.lease = lease
+	close(v.leaseChanged)
+	v.leaseChanged = make(chan struct{})
 }
 
 func (v *Vault) lockToken(ctx context.Context) error {

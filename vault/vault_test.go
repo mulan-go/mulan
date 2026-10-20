@@ -35,11 +35,12 @@ func newTestVault(t *testing.T, mount string, transport roundTripFunc) *Vault {
 		t.Fatalf("vault.NewClient() error = %v", err)
 	}
 	return &Vault{
-		roleID:    "role",
-		secretID:  &approle.SecretID{FromString: "secret"},
-		mount:     mount,
-		client:    client,
-		tokenLock: make(chan struct{}, 1),
+		roleID:       "role",
+		secretID:     &approle.SecretID{FromString: "secret"},
+		mount:        mount,
+		client:       client,
+		tokenLock:    make(chan struct{}, 1),
+		leaseChanged: make(chan struct{}),
 	}
 }
 
