@@ -194,7 +194,7 @@ func createAdaptorCore(dsn string, encoder zapcore.Encoder, lvl zapcore.Level) (
 			lvl = opts.Level
 		}
 		return zapcore.NewCore(encoder, writer, lvl), closer, nil
-	case "http":
+	case "http", "https":
 		opts, err := parseHTTPOptions(dsn)
 		if err != nil {
 			return nil, nil, err

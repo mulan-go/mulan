@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -282,23 +284,74 @@ func TestLogFileRotation(t *testing.T) {
 }
 
 func TestLogHTTP(t *testing.T) {
-	t.Skip("需要实际的 HTTP 服务端")
+	for _, scheme := range []string{"http", "https"} {
+		for _, tt := range []struct {
+			name  string
+			level string
+			query string
+		}{
+			{name: "inherits global level", level: "debug"},
+			{name: "overrides global level", level: "info", query: "&level=debug"},
+		} {
+			t.Run(scheme+"/"+tt.name, func(t *testing.T) {
+				entries := make(chan []map[string]any, 1)
+				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPost || r.URL.Path != "/logs" {
+						t.Errorf("request = %s %s, want POST /logs", r.Method, r.URL.Path)
+					}
+					if r.URL.RawQuery != "" {
+						t.Errorf("adaptor options leaked into request query: %q", r.URL.RawQuery)
+					}
+					if got := r.Header.Get("Content-Type"); got != "application/json" {
+						t.Errorf("Content-Type = %q, want application/json", got)
+					}
+					if (r.TLS != nil) != (scheme == "https") {
+						t.Errorf("TLS connection = %t for %s adaptor", r.TLS != nil, scheme)
+					}
+					var batch []map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+						t.Errorf("decode log batch: %v", err)
+					}
+					w.WriteHeader(http.StatusNoContent)
+					entries <- batch
+				})
+				var server *httptest.Server
+				if scheme == "https" {
+					server = httptest.NewTLSServer(handler)
+				} else {
+					server = httptest.NewServer(handler)
+				}
+				defer server.Close()
 
-	// 使用 DSN 配置 HTTP
-	dsn := "http://localhost:3003/log?timeout=5s&buffer-size=512&batch-size=50&max-retries=2"
+				previousLogger := zap.L()
+				defer zap.ReplaceGlobals(previousLogger)
+				logger, err := log.NewWithConfig(&log.Config{
+					Level:        tt.level,
+					ConsoleLevel: "error",
+					Adaptors: []string{
+						server.URL + "/logs?timeout=1s&buffer-size=8&batch-size=1&max-retries=0" + tt.query,
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer logger.Close()
 
-	logger, err := log.NewWithConfig(&log.Config{
-		Level:    "debug",
-		Adaptors: []string{dsn},
-	})
-	if err != nil {
-		t.Fatal(err)
+				zap.L().Debug("remote debug", zap.String("component", "api"))
+				select {
+				case batch := <-entries:
+					if len(batch) != 1 {
+						t.Fatalf("received %d log entries, want one", len(batch))
+					}
+					if entry := batch[0]; entry["level"] != "debug" || entry["msg"] != "remote debug" || entry["component"] != "api" {
+						t.Errorf("unexpected log entry: %#v", entry)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("configured adaptor did not deliver the log entry")
+				}
+			})
+		}
 	}
-	defer logger.Close()
-
-	logPrint()
-	// 等待异步发送完成
-	time.Sleep(2 * time.Second)
 }
 
 func TestLogWithName(t *testing.T) {
